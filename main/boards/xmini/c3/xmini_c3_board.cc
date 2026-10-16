@@ -12,6 +12,9 @@
 
 #include <esp_log.h>
 #include <esp_efuse_table.h>
+#include <esp_mac.h>
+#include <nvs.h>
+#include <cstdio>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -27,6 +30,50 @@ private:
     Button boot_button_;
     PowerSaveTimer* power_save_timer_ = nullptr;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+
+    // 自定义 MAC 的默认值：当 NVS 里没有 mac_config/custom_mac 时使用。
+    // 部分批次由卖家固件锁定为这个 MAC，且它绑定在本机用户自己的账号上。
+    // 想换 MAC：改这里重新编译，或在 NVS 写入 mac_config/custom_mac 覆盖。
+#ifndef XMINI_C3_CUSTOM_MAC
+#define XMINI_C3_CUSTOM_MAC "72:3c:0a:5b:20:3a"
+#endif
+
+    // 官方固件只读芯片出厂 MAC（esp_read_mac(WIFI_STA)），没有读取自定义 MAC 的逻辑，
+    // 而卖家固件会在 NVS 的 mac_config/custom_mac 里存一个自定义 MAC。
+    // 在 WiFi/网络初始化之前设置 base MAC，可让 STA MAC 与上报服务器的 Device-Id 都用它。
+    void ApplyCustomMac() {
+        char mac_str[24] = {0};
+        nvs_handle_t handle;
+        if (nvs_open("mac_config", NVS_READONLY, &handle) == ESP_OK) {
+            size_t len = sizeof(mac_str);
+            esp_err_t err = nvs_get_str(handle, "custom_mac", mac_str, &len);
+            nvs_close(handle);
+            if (err != ESP_OK) {
+                mac_str[0] = '\0';
+            }
+        }
+        if (mac_str[0] == '\0') {
+            snprintf(mac_str, sizeof(mac_str), "%s", XMINI_C3_CUSTOM_MAC);
+        }
+
+        unsigned int b[6];
+        if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+            ESP_LOGW(TAG, "Invalid custom MAC '%s', keeping factory MAC", mac_str);
+            return;
+        }
+
+        uint8_t base_mac[6];
+        for (int i = 0; i < 6; i++) {
+            base_mac[i] = static_cast<uint8_t>(b[i]);
+        }
+        esp_err_t set_err = esp_base_mac_addr_set(base_mac);
+        if (set_err == ESP_OK) {
+            ESP_LOGW(TAG, "Using custom MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                     base_mac[0], base_mac[1], base_mac[2], base_mac[3], base_mac[4], base_mac[5]);
+        } else {
+            ESP_LOGE(TAG, "Failed to set custom MAC: %s", esp_err_to_name(set_err));
+        }
+    }
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(160, 300);
@@ -171,6 +218,8 @@ private:
 
 public:
     XminiC3Board() : boot_button_(BOOT_BUTTON_GPIO) {
+        // 必须在 WiFi/网络初始化之前设置，才能影响 STA MAC 与上报的 Device-Id
+        ApplyCustomMac();
         InitializeCodecI2c();
         InitializeSsd1306Display();
         InitializeButtons();
